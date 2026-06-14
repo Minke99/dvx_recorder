@@ -44,7 +44,9 @@ import argparse
 import datetime
 import json
 import queue
+import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -260,10 +262,8 @@ def main():
 
     def render(events):
         img = vis.generateImage(events)
-        m = "mocap:waiting" if st["mocap_ok"] is None else (
-            f"mocap:{st['mocap_pkts']}" if st["mocap_ok"] else "mocap:OFF")
         cv2.circle(img, (16, 18), 7, (0, 0, 255), -1)
-        cv2.putText(img, f"REC {st['rec_s']:5.1f}s  {st['events']:,}ev  {st['eps']/1e6:.1f}Meps  {m}",
+        cv2.putText(img, f"REC {st['rec_s']:5.1f}s  {st['events']:,}ev  {st['eps']/1e6:.1f}Meps",
                     (30, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.imshow(win, img)
 
@@ -271,23 +271,24 @@ def main():
     frame_dt = 1.0 / args.fps
     preview_buf = dv.EventStore()   # 累积「上次渲染以来」的事件,渲染时一次性处理
 
-    # 启动 mocap 线程(--no-mocap 时完全不碰 mocap,用于排查丢包来源)
-    q = queue.Queue()
-    stop_evt = threading.Event()
-    mstate = {"ok": None}
+    # mocap 放到【独立子进程】里(各自 GIL,不会卡住本进程的相机采集),靠 sync.json 对齐。
     use_mocap = not args.no_mocap
-    mthread = None
+    mocap_proc = None
     if use_mocap:
-        mthread = threading.Thread(target=mocap_worker,
-                                   args=(q, stop_evt, mstate, args.bind_ip, args.port, args.multicast),
-                                   daemon=True)
-        mthread.start()
+        mocap_cmd = [sys.executable, str(_REPO_ROOT / "record_mocap.py"),
+                     "--sync-from", str(sync_path.resolve()),
+                     "--output", str(mocap_path.resolve()),
+                     "--multicast", args.multicast,
+                     "--port", str(args.port),
+                     "--bind-ip", args.bind_ip]
+        if args.duration > 0:
+            mocap_cmd += ["--duration", str(args.duration)]
+        mocap_proc = subprocess.Popen(mocap_cmd, cwd=str(_REPO_ROOT), stdin=subprocess.DEVNULL)
+        print(f"mocap: 独立子进程 PID={mocap_proc.pid}(等 sync.json 后开始录 {mocap_path.name})")
     else:
         print("mocap: 关(--no-mocap,只录事件)")
 
     anchor = None              # (cam_first_us, wall_first_us)
-    mocap_pending = []         # 锚点确立前先缓存的 mocap 包
-    mocap_idx = 0
     start_wall = time.time()
     rec_accum = 0.0
     last_t = start_wall
@@ -299,9 +300,8 @@ def main():
     quit_key = QuitKey() if not show else None   # 无预览时用终端 q 停止
 
     print("开始录制…  (Ctrl+C 随时停止)")
-    with h5py.File(events_path, "w") as ev_h5, h5py.File(mocap_path, "w") as mc_h5:
+    with h5py.File(events_path, "w") as ev_h5:
         ev_ds = make_event_datasets(ev_h5, args.compress)
-        mc_ds = make_mocap_datasets(mc_h5, args.compress)
         ev_h5.attrs["camera_name"] = cam_name
         ev_h5.attrs["resolution_width"] = int(width)
         ev_h5.attrs["resolution_height"] = int(height)
@@ -311,10 +311,6 @@ def main():
         ev_h5.attrs["compress"] = args.compress
         if denoise:
             ev_h5.attrs["denoise_ba_ms"] = float(ba_ms)
-        mc_h5.attrs["format"] = "mocap_natnet_v2"
-        mc_h5.attrs["multicast_group"] = args.multicast
-        mc_h5.attrs["udp_port"] = int(args.port)
-        mc_h5.attrs["time_unit"] = "us_camera_relative"
 
         try:
             while cam.isRunning():
@@ -331,11 +327,13 @@ def main():
                         cam_first = int(events.getLowestTime())
                         wall_first = int(time.time() * 1e6)
                         anchor = (cam_first, wall_first)
-                        for k, v in (("cam_first_us", cam_first), ("wall_first_us", wall_first)):
-                            ev_h5.attrs[k] = v
-                            mc_h5.attrs[k] = v
-                        sync_path.write_text(json.dumps(
+                        ev_h5.attrs["cam_first_us"] = cam_first
+                        ev_h5.attrs["wall_first_us"] = wall_first
+                        # 写 sync.json -> mocap 子进程读它对齐(用 .tmp 原子替换,避免读到半截)
+                        tmp = sync_path.with_suffix(".json.tmp")
+                        tmp.write_text(json.dumps(
                             {"camera_first_us": cam_first, "wall_first_us": wall_first}))
+                        tmp.replace(sync_path)
                     if denoise:
                         noise.accept(events)
                         events = noise.generateEvents()   # 滤波后再存(预览同源)
@@ -345,25 +343,6 @@ def main():
                         preview_buf.add(events)
                     if time.time() - drain_start >= budget:
                         break
-
-                # 2) 排空 mocap 队列并写盘
-                st["mocap_ok"] = mstate["ok"]
-                drained = []
-                while True:
-                    try:
-                        drained.append(q.get_nowait())
-                    except queue.Empty:
-                        break
-                if anchor is None:
-                    mocap_pending.extend(drained)
-                elif drained or mocap_pending:
-                    cam_first, wall_first = anchor
-                    for recv_wall_us, parsed in (mocap_pending + drained):
-                        t_cam = cam_first + (recv_wall_us - wall_first)
-                        st["mocap_bodies"] += write_mocap_packet(mc_ds, t_cam, parsed, mocap_idx)
-                        mocap_idx += 1
-                    st["mocap_pkts"] = mocap_idx
-                    mocap_pending.clear()
 
                 # 3) 计时 / 时长 / eps
                 now = time.time()
@@ -395,36 +374,40 @@ def main():
                         print("\n收到 q,停止。")
                         break
                     if now - last_status >= args.status_every:
+                        mtag = "" if not use_mocap else (
+                            " mocap:run" if (mocap_proc and mocap_proc.poll() is None) else " mocap:exit")
                         print(f"  rec {rec_accum:5.1f}s  events={st['events']:,}"
-                              f"  {st['eps']/1e6:.2f}Meps  mocap={mocap_idx}", end="\r", flush=True)
+                              f"  {st['eps']/1e6:.2f}Meps{mtag}", end="\r", flush=True)
                         last_status = now
 
-                if not got_any and not drained:
+                if not got_any:
                     time.sleep(0.0005)
         except KeyboardInterrupt:
             print("\n用户中断。")
         finally:
-            stop_evt.set()
             if quit_key is not None:
                 quit_key.restore()
             ev_h5.attrs["num_events"] = int(st["events"])
             ev_h5.attrs["num_packets"] = int(ev_packets)
             ev_h5.attrs["duration_wall_s"] = float(rec_accum)
-            mc_h5.attrs["num_packets"] = int(mocap_idx)
-            mc_h5.attrs["num_body_observations"] = int(st["mocap_bodies"])
-            mc_h5.attrs["duration_wall_s"] = float(rec_accum)
             if show:
                 cv2.destroyAllWindows()
 
-    if mthread is not None:
-        mthread.join(timeout=1.0)
+    # 停 mocap 子进程
+    if mocap_proc is not None and mocap_proc.poll() is None:
+        try:
+            mocap_proc.send_signal(signal.SIGINT)   # record_mocap 收到会写完 attrs 再退出
+            mocap_proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, ProcessLookupError):
+            mocap_proc.kill()
+
     print(f"\n已保存 session: {session_dir}")
     print(f"  events.h5 : {st['events']:,} 事件 / {ev_packets} 批次")
-    print(f"  mocap.h5  : {mocap_idx:,} 包 / {st['mocap_bodies']:,} 刚体观测  (mocap_ok={mstate['ok']})")
-    if mstate["ok"] is False:
-        print("  ⚠️ 没收到 mocap:检查 Motive 是否在广播、组播/端口/网卡是否正确。")
-    elif mocap_idx == 0:
-        print("  ⚠️ mocap 包数为 0:确认 Motive 正在 streaming(NatNet)。")
+    if use_mocap:
+        if not mocap_path.exists():
+            print("  ⚠️ mocap.h5 没生成:确认 Motive 在 streaming、组播/端口/网卡正确。")
+        else:
+            print(f"  mocap.h5  : 由子进程录制(独立进程,不抢事件采集)")
     print(f"  校验对齐: python tools/check_session.py {session_dir}")
 
 
