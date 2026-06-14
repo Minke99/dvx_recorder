@@ -195,7 +195,7 @@ def main():
     ap.add_argument("--serial", default=None, help="指定相机序列号")
     args = ap.parse_args()
 
-    session_name = args.session_name or datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    session_name = args.session_name or datetime.datetime.now().strftime("%Y%m%d%H%M")
     session_dir = Path(args.session_root) / session_name
     session_dir.mkdir(parents=True, exist_ok=True)
     events_path = session_dir / "events.h5"
