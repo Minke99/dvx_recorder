@@ -26,7 +26,9 @@
 默认【不显示实时画面】,只录盘(高事件率下也稳)。加 --preview 才开窗口。
 默认【对存盘的事件做去噪】(BackgroundActivityNoiseFilter,--ba-ms 默认 3.0);
 加 --no-denoise 则存原始事件。
-HDF5 用 gzip+shuffle 压缩、x/y 用 int16,文件比未压缩小约 5 倍。
+HDF5 压缩可选(--compress lzf/gzip/none,默认 lzf)+ x/y 用 int16。
+注意:慢设备(如 Jetson)用 gzip 可能因 CPU 跟不上而丢事件(回放出现黑帧)
+-> 改用 lzf(默认)或 none。
 
 用法:
     python record_session.py                      # 只录盘(无窗口),Ctrl+C 或终端 q 停止
@@ -63,11 +65,20 @@ from lib.quit_key import QuitKey
 
 # --------------------------- h5 helpers (模块级,便于测试) ---------------------------
 
-def create_ds(group, name, dtype):
-    # gzip(level 1) + shuffle:对事件这种 (单调 t / 小坐标) 数据能压到约 1/5,基本无损且很快
+_COMPRESS = {
+    # gzip: 最省盘但最吃 CPU(慢设备如 Jetson 可能跟不上 -> 丢事件)
+    "gzip": dict(compression="gzip", compression_opts=1, shuffle=True),
+    # lzf: 快很多、压缩约 3 倍,两边都能跑(默认)
+    "lzf": dict(compression="lzf", shuffle=True),
+    # none: 最快、最大,慢设备保命用
+    "none": dict(),
+}
+
+
+def create_ds(group, name, dtype, compress="lzf"):
     return group.create_dataset(name, shape=(0,), maxshape=(None,),
                                 dtype=dtype, chunks=(1 << 16,),
-                                compression="gzip", compression_opts=1, shuffle=True)
+                                **_COMPRESS.get(compress, _COMPRESS["lzf"]))
 
 
 def append_ds(ds, arr):
@@ -77,30 +88,30 @@ def append_ds(ds, arr):
     ds[n:] = arr
 
 
-def make_event_datasets(h5):
+def make_event_datasets(h5, compress="lzf"):
     g = h5.create_group("events")
     return {
         # x,y 本来就是 int16(分辨率内),不必用 int32
-        "x": create_ds(g, "x", np.int16),
-        "y": create_ds(g, "y", np.int16),
-        "t": create_ds(g, "t", np.int64),
-        "p": create_ds(g, "p", np.int8),
+        "x": create_ds(g, "x", np.int16, compress),
+        "y": create_ds(g, "y", np.int16, compress),
+        "t": create_ds(g, "t", np.int64, compress),
+        "p": create_ds(g, "p", np.int8, compress),
     }
 
 
-def make_mocap_datasets(h5):
+def make_mocap_datasets(h5, compress="lzf"):
     g = h5.create_group("mocap")
     names_i64 = ["t", "frame"]
     names_i32 = ["num_bodies", "rb_t_idx", "rb_id"]
     names_f32 = ["rb_x", "rb_y", "rb_z", "rb_qx", "rb_qy", "rb_qz", "rb_qw", "rb_mean_error"]
     d = {}
     for n in names_i64:
-        d[n] = create_ds(g, n, np.int64)
+        d[n] = create_ds(g, n, np.int64, compress)
     for n in names_i32:
-        d[n] = create_ds(g, n, np.int32)
+        d[n] = create_ds(g, n, np.int32, compress)
     for n in names_f32:
-        d[n] = create_ds(g, n, np.float32)
-    d["rb_tracking_valid"] = create_ds(g, "rb_tracking_valid", np.int8)
+        d[n] = create_ds(g, n, np.float32, compress)
+    d["rb_tracking_valid"] = create_ds(g, "rb_tracking_valid", np.int8, compress)
     return d
 
 
@@ -189,6 +200,8 @@ def main():
     ap.add_argument("--preview", action="store_true",
                     help="开实时预览窗口(默认关:只录盘,避免高事件率下显示拖慢相机排空)")
     ap.add_argument("--status-every", type=float, default=1.0, help="无预览时每隔几秒打印一次状态")
+    ap.add_argument("--compress", choices=["gzip", "lzf", "none"], default="lzf",
+                    help="h5 压缩: lzf(默认,快+小,两边都能跑) / gzip(最小但吃CPU,慢设备会丢事件) / none(最快最大)")
     ap.add_argument("--fps", type=float, default=30.0, help="预览刷新率")
     ap.add_argument("--scale", type=float, default=1.0, help="窗口放大倍数")
     ap.add_argument("--swap", action="store_true", help="交换颜色(红=ON,绿=OFF)")
@@ -239,6 +252,7 @@ def main():
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win, int(width * args.scale), int(height * args.scale))
     print("滤波: " + (f"开 (ba-ms={ba_ms:g},存去噪后事件)" if denoise else "关 (存原始事件)"))
+    print(f"压缩: {args.compress}" + ("  (慢设备如 Jetson 建议 lzf 或 none,避免丢事件)" if args.compress == "gzip" else ""))
     print("实时预览: " + ("开 (q/ESC 停止)" if show else "关 —— 只录盘。停止: 终端 q 或 Ctrl+C"))
 
     st = {"rec_s": 0.0, "events": 0, "mocap_pkts": 0, "mocap_bodies": 0, "mocap_ok": None, "eps": 0}
@@ -280,14 +294,15 @@ def main():
 
     print("开始录制…  (Ctrl+C 随时停止)")
     with h5py.File(events_path, "w") as ev_h5, h5py.File(mocap_path, "w") as mc_h5:
-        ev_ds = make_event_datasets(ev_h5)
-        mc_ds = make_mocap_datasets(mc_h5)
+        ev_ds = make_event_datasets(ev_h5, args.compress)
+        mc_ds = make_mocap_datasets(mc_h5, args.compress)
         ev_h5.attrs["camera_name"] = cam_name
         ev_h5.attrs["resolution_width"] = int(width)
         ev_h5.attrs["resolution_height"] = int(height)
         ev_h5.attrs["time_unit"] = "us_camera_relative"
         ev_h5.attrs["format"] = "raw_dvx_events_v1"
         ev_h5.attrs["denoised"] = bool(denoise)
+        ev_h5.attrs["compress"] = args.compress
         if denoise:
             ev_h5.attrs["denoise_ba_ms"] = float(ba_ms)
         mc_h5.attrs["format"] = "mocap_natnet_v2"
