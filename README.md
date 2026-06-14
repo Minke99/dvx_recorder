@@ -24,7 +24,8 @@ USB 相机同一时刻只能被一个程序打开。**运行前请先关闭 DV-G
 |------|------|
 | `dvx_live.py` | 基础版,纯实时预览(保底使用) |
 | `dvx_live_denoise.py` | 去噪版,推荐日常看画面 |
-| `dvx_record.py` | 实时预览 + 同时录制成 `.h5` 文件 |
+| `dvx_record.py` | 实时预览 + 同时录制成 `.h5` 文件(只录事件) |
+| `record_session.py` | **同步录制事件 + mocap,时间对齐**(预览 + events.h5 + mocap.h5) |
 
 ### 基础版
 
@@ -104,20 +105,42 @@ with h5py.File("recordings/take1.h5") as f:
 | `tools/check_session.py` | 校验录好的 events.h5 + mocap.h5(结构 / 时间对齐) |
 | `tools/depack_h5_data.py` | 把一次 session 解包:事件渲染成 MP4 + 画 mocap 轨迹 |
 
+### 同步录制(事件 + mocap,时间对齐)—— 推荐
+
+`record_session.py` 在**同一个进程**里同时收 DVX 事件和 mocap UDP,自动把两者放到同一条
+「相机相对微秒」时间轴上,输出一个 session 目录:
+
 ```bash
-# 1) 先确认能收到动捕数据(默认 multicast 239.255.42.99, port 1511)
+# 0) 确认 Motive 正在 streaming(NatNet),先用它看一眼收不收得到
 python tools/check_rigid_body_LIS.py
 
-# 2) 录 mocap(按 q 停止;或 --duration 10 录 10 秒)
+# 1) 同步录(按 q 停止;或 --duration 10)
+python record_session.py --duration 10
+#   -> recordings/<时间戳>/events.h5 + mocap.h5 + sync.json
+
+# 2) 校验对齐(结构 + 时间对齐 + 运动互相关)
+python tools/check_session.py recordings/<时间戳>
+
+# 3) 解包:事件渲染 MP4 + 画 mocap 轨迹
+python tools/depack_h5_data.py recordings/<时间戳>
+```
+
+对齐原理:以第一批事件为锚点 `cam_first_us / wall_first_us`,每个 mocap 包按
+`t_cam = cam_first_us + (到达墙钟 − wall_first_us)` 换算到相机时间轴。这样 `events/t` 与
+`mocap/t` 共用同一时间轴(`time_unit="us_camera_relative"`)。已用合成数据跑通官方
+`check_session.py`:overlap、startup offset < 500ms 全部 OK。
+
+> 想验证对齐准不准:录的时候**在相机前挥动刚体**,`check_session.py` 会做事件率 vs 刚体速度的互相关,给出最佳 lag(应 < 30ms)。
+
+### 只录 mocap(不带事件)
+
+```bash
 python record_mocap.py --output recordings/mocap.h5 --duration 10
 ```
 
 `mocap.h5` 里 `mocap/` 组含 `t, frame, num_bodies` 及每个刚体的 `rb_x/y/z`、`rb_qx/qy/qz/qw`、
-`rb_tracking_valid`、`rb_mean_error` 等;默认时间戳是墙钟 Unix 微秒(`time_unit="us_since_epoch"`)。
-
-> ⚠️ **时间对齐说明**:`record_mocap.py --sync-from` 可把 mocap 时间戳对齐到相机时间轴,
-> 但它依赖一个同步文件,而本目录的 `dvx_record.py` 目前**不写**这个文件(原工程是 `record_raw.py --sync-out` 写的)。
-> 所以现在:单独录 mocap 没问题;要做「事件 + mocap 严格时间对齐」需要再给 `dvx_record.py` 补一个 `--sync-out`(可让我加)。
+`rb_tracking_valid`、`rb_mean_error` 等;单独跑时时间戳是墙钟 Unix 微秒(`time_unit="us_since_epoch"`)。
+要和事件对齐请直接用上面的 `record_session.py`。
 
 ## 其它常用参数(脚本通用)
 
