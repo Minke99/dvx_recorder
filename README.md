@@ -25,7 +25,8 @@ USB 相机同一时刻只能被一个程序打开。**运行前请先关闭 DV-G
 | `dvx_live.py` | 基础版,纯实时预览(保底使用) |
 | `dvx_live_denoise.py` | 去噪版,推荐日常看画面 |
 | `dvx_record.py` | 实时预览 + 同时录制成 `.h5` 文件(只录事件) |
-| `record_session.py` | **同步录制事件 + mocap,时间对齐**(预览 + events.h5 + mocap.h5) |
+| `record_session.py` | **同步录制事件 + mocap,时间对齐**(events.h5 + mocap.h5) |
+| `record_video.py` | 录【事件视频 mp4】+ mocap(轻量,给 Jetson 等慢设备) |
 
 ### 基础版
 
@@ -150,6 +151,22 @@ python tools/depack_h5_data.py recordings/<时间戳>
 
 事件数据量本质由**事件率**决定(运动越多/越近/纹理越密 → 事件越多 → 文件越大),
 压缩只是把同样的事件存得更省。
+
+### 轻量模式:录事件视频(给 Jetson 等慢设备)
+
+`record_video.py` 不存每个事件,而是把事件按 `--fps` 累积成帧、直接编码进 `events.mp4`。
+**数据量和 CPU 由帧率决定、与事件率无关**,所以慢设备也不会丢事件、文件还小。
+
+```bash
+python record_video.py --duration 10        # -> recordings/<ts>/events.mp4 + mocap.h5
+python record_video.py --fps 60
+python record_video.py --no-denoise          # 更省 CPU
+```
+
+- **代价(有损)**:只有 fps 帧(默认 30)、没有微秒级原始事件,不能事后改帧率/事件数重渲;
+  mocap 对齐精度到帧(~1/fps)。需要原始事件 + 微秒对齐就用 `record_session.py`。
+- 对齐:`sync.json` 存 `camera_first_us / video_fps`;mocap 时刻 `t` 对应帧
+  `round((t − camera_first_us) / (1e6/fps))`(mocap.h5 仍是相机时间轴)。
 
 ### 只录 mocap(不带事件)
 
