@@ -65,8 +65,10 @@ def open_source(args):
 
 
 def create_ds(group, name, dtype):
+    # gzip + shuffle:事件数据约压到 1/5,基本无损
     return group.create_dataset(name, shape=(0,), maxshape=(None,),
-                                dtype=dtype, chunks=(1 << 16,))
+                                dtype=dtype, chunks=(1 << 16,),
+                                compression="gzip", compression_opts=1, shuffle=True)
 
 
 def append_ds(ds, arr):
@@ -162,8 +164,8 @@ def main():
 
     with h5py.File(out_path, "w") as h:
         g = h.create_group("events")
-        x_ds = create_ds(g, "x", np.int32)
-        y_ds = create_ds(g, "y", np.int32)
+        x_ds = create_ds(g, "x", np.int16)
+        y_ds = create_ds(g, "y", np.int16)
         t_ds = create_ds(g, "t", np.int64)
         p_ds = create_ds(g, "p", np.int8)
         h.attrs["camera_name"] = cam_name

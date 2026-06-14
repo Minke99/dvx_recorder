@@ -67,9 +67,9 @@ def render_event_video(events_h5: Path, out_mp4: Path, mode: str,
             fx = x[s:e]; fy = y[s:e]; fp = p[s:e]
             pos = fp == 1
             neg = ~pos
-            # OpenCV is BGR: positive -> red, negative -> blue
-            img[fy[pos], fx[pos]] = (0, 0, 255)
-            img[fy[neg], fx[neg]] = (255, 0, 0)
+            # OpenCV 是 BGR: ON(变亮)=绿, OFF(变暗)=红 —— 和实时预览一致
+            img[fy[pos], fx[pos]] = (0, 255, 0)
+            img[fy[neg], fx[neg]] = (0, 0, 255)
         writer.write(img)
         if fi % 50 == 0:
             print(f"  frame {fi}/{num_frames}")

@@ -23,13 +23,17 @@
 
 依赖: pip install dv-processing opencv-python numpy h5py tqdm
 
+默认【不显示实时画面】,只录盘(高事件率下也稳)。加 --preview 才开窗口。
+HDF5 用 gzip+shuffle 压缩、x/y 用 int16,文件比未压缩小约 5 倍。
+
 用法:
-    python record_session.py                      # 录到 recordings/<时间戳>/
-    python record_session.py --duration 10        # 录 10 秒
+    python record_session.py                      # 只录盘(无窗口),Ctrl+C 或终端 q 停止
+    python record_session.py --duration 10        # 录 10 秒后自动停
+    python record_session.py --preview            # 开实时预览窗口(q/ESC 停, d 开关去噪)
     python record_session.py --session-name take1
     python record_session.py --port 1511 --multicast 239.255.42.99   # NatNet 网络参数
 
-运行时:q/ESC 停止并保存,d 开关预览去噪。左上角显示 REC/时长/事件数/mocap 包数。
+无预览时终端每秒打印 rec 时长 / 事件数 / Meps / mocap 包数;Ctrl+C 或按 q 停止。
 """
 
 import argparse
@@ -52,13 +56,16 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from LIS import UdpReceiver
+from lib.quit_key import QuitKey
 
 
 # --------------------------- h5 helpers (模块级,便于测试) ---------------------------
 
 def create_ds(group, name, dtype):
+    # gzip(level 1) + shuffle:对事件这种 (单调 t / 小坐标) 数据能压到约 1/5,基本无损且很快
     return group.create_dataset(name, shape=(0,), maxshape=(None,),
-                                dtype=dtype, chunks=(1 << 16,))
+                                dtype=dtype, chunks=(1 << 16,),
+                                compression="gzip", compression_opts=1, shuffle=True)
 
 
 def append_ds(ds, arr):
@@ -71,8 +78,9 @@ def append_ds(ds, arr):
 def make_event_datasets(h5):
     g = h5.create_group("events")
     return {
-        "x": create_ds(g, "x", np.int32),
-        "y": create_ds(g, "y", np.int32),
+        # x,y 本来就是 int16(分辨率内),不必用 int32
+        "x": create_ds(g, "x", np.int16),
+        "y": create_ds(g, "y", np.int16),
         "t": create_ds(g, "t", np.int64),
         "p": create_ds(g, "p", np.int8),
     }
@@ -175,7 +183,10 @@ def main():
     ap.add_argument("--multicast", default="239.255.42.99", help="NatNet 组播地址")
     ap.add_argument("--port", type=int, default=1511, help="NatNet 端口")
     ap.add_argument("--bind-ip", default="0.0.0.0", help="本地绑定 IP")
-    # 预览
+    # 预览(默认关:只录盘;加 --preview 才开实时窗口)
+    ap.add_argument("--preview", action="store_true",
+                    help="开实时预览窗口(默认关:只录盘,避免高事件率下显示拖慢相机排空)")
+    ap.add_argument("--status-every", type=float, default=1.0, help="无预览时每隔几秒打印一次状态")
     ap.add_argument("--fps", type=float, default=30.0, help="预览刷新率")
     ap.add_argument("--scale", type=float, default=1.0, help="窗口放大倍数")
     ap.add_argument("--swap", action="store_true", help="交换颜色(红=ON,绿=OFF)")
@@ -203,35 +214,42 @@ def main():
     print(f"session 目录: {session_dir}")
     print(f"NatNet: {args.multicast}:{args.port} (bind {args.bind_ip})")
 
-    # 预览渲染器 + 去噪
-    vis = dv.visualization.EventVisualizer(res)
-    vis.setBackgroundColor(dv.visualization.colors.black())
-    on_c, off_c = dv.visualization.colors.lime(), dv.visualization.colors.red()
-    if args.swap:
-        on_c, off_c = off_c, on_c
-    vis.setPositiveColor(on_c)
-    vis.setNegativeColor(off_c)
-    preview_denoise = not args.no_denoise
-    noise = dv.noise.BackgroundActivityNoiseFilter(
-        res, backgroundActivityDuration=datetime.timedelta(milliseconds=max(0.1, args.ba_ms)))
-
+    show = args.preview
     win = "DVX + mocap session"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win, int(width * args.scale), int(height * args.scale))
+    preview_denoise = not args.no_denoise
+    vis = None
+    noise = None
+    if show:
+        # 预览渲染器 + 去噪(只有开预览时才需要)
+        vis = dv.visualization.EventVisualizer(res)
+        vis.setBackgroundColor(dv.visualization.colors.black())
+        on_c, off_c = dv.visualization.colors.lime(), dv.visualization.colors.red()
+        if args.swap:
+            on_c, off_c = off_c, on_c
+        vis.setPositiveColor(on_c)
+        vis.setNegativeColor(off_c)
+        noise = dv.noise.BackgroundActivityNoiseFilter(
+            res, backgroundActivityDuration=datetime.timedelta(milliseconds=max(0.1, args.ba_ms)))
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win, int(width * args.scale), int(height * args.scale))
+        print("实时预览: 开(q/ESC 停止 | d 开关去噪)")
+    else:
+        print("实时预览: 关 —— 只录盘。停止: 终端按 q 或 Ctrl+C(或用 --duration)")
 
-    st = {"rec_s": 0.0, "events": 0, "mocap_pkts": 0, "mocap_bodies": 0, "mocap_ok": None}
+    st = {"rec_s": 0.0, "events": 0, "mocap_pkts": 0, "mocap_bodies": 0, "mocap_ok": None, "eps": 0}
 
     def render(events):
         img = vis.generateImage(events)
         m = "mocap:waiting" if st["mocap_ok"] is None else (
             f"mocap:{st['mocap_pkts']}" if st["mocap_ok"] else "mocap:OFF")
         cv2.circle(img, (16, 18), 7, (0, 0, 255), -1)
-        cv2.putText(img, f"REC {st['rec_s']:5.1f}s  {st['events']:,}ev  {m}",
+        cv2.putText(img, f"REC {st['rec_s']:5.1f}s  {st['events']:,}ev  {st['eps']/1e6:.1f}Meps  {m}",
                     (30, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.imshow(win, img)
 
-    slicer = dv.EventStreamSlicer()
-    slicer.doEveryTimeInterval(datetime.timedelta(milliseconds=1000.0 / args.fps), render)
+    # 预览按墙钟节流(不用 EventStreamSlicer,避免被事件时间牵着走累积延时)
+    frame_dt = 1.0 / args.fps
+    preview_buf = dv.EventStore()   # 累积「上次渲染以来」的事件,渲染时一次性处理
 
     # 启动 mocap 线程
     q = queue.Queue()
@@ -248,9 +266,14 @@ def main():
     start_wall = time.time()
     rec_accum = 0.0
     last_t = start_wall
+    last_render = start_wall
+    last_status = start_wall
+    last_eps_t = start_wall
+    last_ev_count = 0
     ev_packets = 0
+    quit_key = QuitKey() if not show else None   # 无预览时用终端 q 停止
 
-    print("开始录制。 q/ESC 停止保存 | d 开关预览去噪")
+    print("开始录制…  (Ctrl+C 随时停止)")
     with h5py.File(events_path, "w") as ev_h5, h5py.File(mocap_path, "w") as mc_h5:
         ev_ds = make_event_datasets(ev_h5)
         mc_ds = make_mocap_datasets(mc_h5)
@@ -266,8 +289,15 @@ def main():
 
         try:
             while cam.isRunning():
-                events = cam.getNextEventBatch()
-                if events is not None and events.size() > 0:
+                # 1) 尽量排空相机缓冲并写盘(中途不碰 GUI),避免高事件率下排不完导致延时累积
+                got_any = False
+                drain_start = time.time()
+                budget = frame_dt if show else 0.1
+                while True:
+                    events = cam.getNextEventBatch()
+                    if events is None or events.size() == 0:
+                        break
+                    got_any = True
                     if anchor is None:
                         cam_first = int(events.getLowestTime())
                         wall_first = int(time.time() * 1e6)
@@ -279,14 +309,12 @@ def main():
                             {"camera_first_us": cam_first, "wall_first_us": wall_first}))
                     st["events"] += write_event_batch(ev_ds, events)
                     ev_packets += 1
-                    # 预览
-                    if preview_denoise:
-                        noise.accept(events)
-                        slicer.accept(noise.generateEvents())
-                    else:
-                        slicer.accept(events)
+                    if show:
+                        preview_buf.add(events)
+                    if time.time() - drain_start >= budget:
+                        break
 
-                # 处理 mocap 队列
+                # 2) 排空 mocap 队列并写盘
                 st["mocap_ok"] = mstate["ok"]
                 drained = []
                 while True:
@@ -296,42 +324,71 @@ def main():
                         break
                 if anchor is None:
                     mocap_pending.extend(drained)
-                else:
+                elif drained or mocap_pending:
                     cam_first, wall_first = anchor
                     for recv_wall_us, parsed in (mocap_pending + drained):
                         t_cam = cam_first + (recv_wall_us - wall_first)
                         st["mocap_bodies"] += write_mocap_packet(mc_ds, t_cam, parsed, mocap_idx)
                         mocap_idx += 1
-                        st["mocap_pkts"] = mocap_idx
+                    st["mocap_pkts"] = mocap_idx
                     mocap_pending.clear()
 
+                # 3) 计时 / 时长 / eps
                 now = time.time()
                 rec_accum += now - last_t
                 last_t = now
                 st["rec_s"] = rec_accum
+                if now - last_eps_t >= 0.5:
+                    st["eps"] = int((st["events"] - last_ev_count) / (now - last_eps_t))
+                    last_ev_count = st["events"]
+                    last_eps_t = now
                 if args.duration > 0 and rec_accum >= args.duration:
                     print("\n到达设定时长,停止。")
                     break
 
-                key = cv2.waitKey(1) & 0xFF
-                if key in (27, ord("q")):
-                    break
-                elif key == ord("d"):
-                    preview_denoise = not preview_denoise
-                    print(f"\n预览去噪 -> {'开' if preview_denoise else '关'}")
-                if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
-                    break
+                # 4) GUI 渲染(仅 --preview,墙钟节流)或 无预览时的停止键/状态
+                if show:
+                    if now - last_render >= frame_dt:
+                        ev = preview_buf
+                        preview_buf = dv.EventStore()
+                        if preview_denoise and ev.size() > 0:
+                            noise.accept(ev)
+                            ev = noise.generateEvents()
+                        render(ev)
+                        last_render = now
+                        key = cv2.waitKey(1) & 0xFF
+                        if key in (27, ord("q")):
+                            break
+                        elif key == ord("d"):
+                            preview_denoise = not preview_denoise
+                            print(f"\n预览去噪 -> {'开' if preview_denoise else '关'}")
+                        if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
+                            break
+                else:
+                    if quit_key is not None and quit_key.pressed():
+                        print("\n收到 q,停止。")
+                        break
+                    if now - last_status >= args.status_every:
+                        print(f"  rec {rec_accum:5.1f}s  events={st['events']:,}"
+                              f"  {st['eps']/1e6:.2f}Meps  mocap={mocap_idx}", end="\r", flush=True)
+                        last_status = now
+
+                if not got_any and not drained:
+                    time.sleep(0.0005)
         except KeyboardInterrupt:
             print("\n用户中断。")
         finally:
             stop_evt.set()
+            if quit_key is not None:
+                quit_key.restore()
             ev_h5.attrs["num_events"] = int(st["events"])
             ev_h5.attrs["num_packets"] = int(ev_packets)
             ev_h5.attrs["duration_wall_s"] = float(rec_accum)
             mc_h5.attrs["num_packets"] = int(mocap_idx)
             mc_h5.attrs["num_body_observations"] = int(st["mocap_bodies"])
             mc_h5.attrs["duration_wall_s"] = float(rec_accum)
-            cv2.destroyAllWindows()
+            if show:
+                cv2.destroyAllWindows()
 
     mthread.join(timeout=1.0)
     print(f"\n已保存 session: {session_dir}")

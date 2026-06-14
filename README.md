@@ -114,9 +114,13 @@ with h5py.File("recordings/take1.h5") as f:
 # 0) 确认 Motive 正在 streaming(NatNet),先用它看一眼收不收得到
 python tools/check_rigid_body_LIS.py
 
-# 1) 同步录(按 q 停止;或 --duration 10)
+# 1) 同步录 —— 默认【不开实时画面】,只录盘(高事件率下也稳)
 python record_session.py --duration 10
 #   -> recordings/<时间戳>/events.h5 + mocap.h5 + sync.json
+#   终端会每秒打印 rec时长 / 事件数 / Meps / mocap包数;Ctrl+C 或按 q 停止
+
+# 1b) 想看实时画面再加 --preview(高事件率下可能略有延时,不影响存盘)
+python record_session.py --preview
 
 # 2) 校验对齐(结构 + 时间对齐 + 运动互相关)
 python tools/check_session.py recordings/<时间戳>
@@ -131,6 +135,11 @@ python tools/depack_h5_data.py recordings/<时间戳>
 `check_session.py`:overlap、startup offset < 500ms 全部 OK。
 
 > 想验证对齐准不准:录的时候**在相机前挥动刚体**,`check_session.py` 会做事件率 vs 刚体速度的互相关,给出最佳 lag(应 < 30ms)。
+
+**文件大小**:events.h5 用 gzip+shuffle 压缩、x/y 存 int16,比未压缩小约 5 倍
+(实测约 2.6~3.3 B/event;未压缩是 17)。注意事件数据量本质上由**事件率**决定——
+画面里运动越多/越近/纹理越密,事件越多、文件越大;压缩只是把同样的事件存得更省。
+若还想更小:用 `dvx_live_denoise` 那套的去噪先验证场景、或减小运动范围/距离。
 
 ### 只录 mocap(不带事件)
 
