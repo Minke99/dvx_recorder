@@ -24,6 +24,8 @@
 依赖: pip install dv-processing opencv-python numpy h5py tqdm
 
 默认【不显示实时画面】,只录盘(高事件率下也稳)。加 --preview 才开窗口。
+默认【对存盘的事件做去噪】(BackgroundActivityNoiseFilter,--ba-ms 默认 3.0);
+加 --no-denoise 则存原始事件。
 HDF5 用 gzip+shuffle 压缩、x/y 用 int16,文件比未压缩小约 5 倍。
 
 用法:
@@ -190,8 +192,10 @@ def main():
     ap.add_argument("--fps", type=float, default=30.0, help="预览刷新率")
     ap.add_argument("--scale", type=float, default=1.0, help="窗口放大倍数")
     ap.add_argument("--swap", action="store_true", help="交换颜色(红=ON,绿=OFF)")
-    ap.add_argument("--ba-ms", type=float, default=3.0, dest="ba_ms", help="预览去噪相关窗口(ms),越小越狠")
-    ap.add_argument("--no-denoise", action="store_true", help="预览不去噪")
+    ap.add_argument("--ba-ms", type=float, default=3.0, dest="ba_ms",
+                    help="去噪相关窗口(ms),越小去得越狠 (默认 3.0)。作用于【存盘的事件】")
+    ap.add_argument("--no-denoise", action="store_true",
+                    help="不滤波,存原始事件(默认会先用 BackgroundActivityNoiseFilter 去噪再存)")
     ap.add_argument("--serial", default=None, help="指定相机序列号")
     args = ap.parse_args()
 
@@ -216,11 +220,15 @@ def main():
 
     show = args.preview
     win = "DVX + mocap session"
-    preview_denoise = not args.no_denoise
-    vis = None
+    # 去噪默认开,且作用于【存盘的事件】;--no-denoise 才存原始
+    denoise = not args.no_denoise
+    ba_ms = max(0.1, args.ba_ms)
     noise = None
+    if denoise:
+        noise = dv.noise.BackgroundActivityNoiseFilter(
+            res, backgroundActivityDuration=datetime.timedelta(milliseconds=ba_ms))
+    vis = None
     if show:
-        # 预览渲染器 + 去噪(只有开预览时才需要)
         vis = dv.visualization.EventVisualizer(res)
         vis.setBackgroundColor(dv.visualization.colors.black())
         on_c, off_c = dv.visualization.colors.lime(), dv.visualization.colors.red()
@@ -228,13 +236,10 @@ def main():
             on_c, off_c = off_c, on_c
         vis.setPositiveColor(on_c)
         vis.setNegativeColor(off_c)
-        noise = dv.noise.BackgroundActivityNoiseFilter(
-            res, backgroundActivityDuration=datetime.timedelta(milliseconds=max(0.1, args.ba_ms)))
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win, int(width * args.scale), int(height * args.scale))
-        print("实时预览: 开(q/ESC 停止 | d 开关去噪)")
-    else:
-        print("实时预览: 关 —— 只录盘。停止: 终端按 q 或 Ctrl+C(或用 --duration)")
+    print("滤波: " + (f"开 (ba-ms={ba_ms:g},存去噪后事件)" if denoise else "关 (存原始事件)"))
+    print("实时预览: " + ("开 (q/ESC 停止)" if show else "关 —— 只录盘。停止: 终端 q 或 Ctrl+C"))
 
     st = {"rec_s": 0.0, "events": 0, "mocap_pkts": 0, "mocap_bodies": 0, "mocap_ok": None, "eps": 0}
 
@@ -282,6 +287,9 @@ def main():
         ev_h5.attrs["resolution_height"] = int(height)
         ev_h5.attrs["time_unit"] = "us_camera_relative"
         ev_h5.attrs["format"] = "raw_dvx_events_v1"
+        ev_h5.attrs["denoised"] = bool(denoise)
+        if denoise:
+            ev_h5.attrs["denoise_ba_ms"] = float(ba_ms)
         mc_h5.attrs["format"] = "mocap_natnet_v2"
         mc_h5.attrs["multicast_group"] = args.multicast
         mc_h5.attrs["udp_port"] = int(args.port)
@@ -307,9 +315,12 @@ def main():
                             mc_h5.attrs[k] = v
                         sync_path.write_text(json.dumps(
                             {"camera_first_us": cam_first, "wall_first_us": wall_first}))
+                    if denoise:
+                        noise.accept(events)
+                        events = noise.generateEvents()   # 滤波后再存(预览同源)
                     st["events"] += write_event_batch(ev_ds, events)
                     ev_packets += 1
-                    if show:
+                    if show and events.size() > 0:
                         preview_buf.add(events)
                     if time.time() - drain_start >= budget:
                         break
@@ -351,17 +362,11 @@ def main():
                     if now - last_render >= frame_dt:
                         ev = preview_buf
                         preview_buf = dv.EventStore()
-                        if preview_denoise and ev.size() > 0:
-                            noise.accept(ev)
-                            ev = noise.generateEvents()
-                        render(ev)
+                        render(ev)   # preview_buf 已是滤波后的事件,直接画
                         last_render = now
                         key = cv2.waitKey(1) & 0xFF
                         if key in (27, ord("q")):
                             break
-                        elif key == ord("d"):
-                            preview_denoise = not preview_denoise
-                            print(f"\n预览去噪 -> {'开' if preview_denoise else '关'}")
                         if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
                             break
                 else:
