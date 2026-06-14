@@ -6,7 +6,10 @@
 ## 环境依赖
 
 ```bash
+# 事件相机预览 / 录制
 pip install dv-processing opencv-python numpy h5py
+# 额外:mocap UDP 接收 + tools 分析脚本
+pip install tqdm matplotlib
 ```
 
 ## 前提
@@ -88,6 +91,33 @@ with h5py.File("recordings/take1.h5") as f:
     x = f["events/x"][:]; y = f["events/y"][:]
     t = f["events/t"][:]; p = f["events/p"][:]   # t 单位 us, p∈{0,1}
 ```
+
+## Mocap 录制(NatNet / OptiTrack,UDP)
+
+从动捕(Motive / OptiTrack 的 NatNet 广播)接收刚体位姿,存成 HDF5。相关文件搬自 `record_dvx`:
+
+| 文件 | 说明 |
+|------|------|
+| `LIS/UdpReceiver.py` | NatNet UDP 接收 + 解析刚体(`UdpRigidBodies` 类) |
+| `record_mocap.py` | 把刚体流录成 `recordings/mocap.h5` |
+| `tools/check_rigid_body_LIS.py` | 实时打印收到的刚体 ID / 位置,**先用它确认 UDP 收得到数据** |
+| `tools/check_session.py` | 校验录好的 events.h5 + mocap.h5(结构 / 时间对齐) |
+| `tools/depack_h5_data.py` | 把一次 session 解包:事件渲染成 MP4 + 画 mocap 轨迹 |
+
+```bash
+# 1) 先确认能收到动捕数据(默认 multicast 239.255.42.99, port 1511)
+python tools/check_rigid_body_LIS.py
+
+# 2) 录 mocap(按 q 停止;或 --duration 10 录 10 秒)
+python record_mocap.py --output recordings/mocap.h5 --duration 10
+```
+
+`mocap.h5` 里 `mocap/` 组含 `t, frame, num_bodies` 及每个刚体的 `rb_x/y/z`、`rb_qx/qy/qz/qw`、
+`rb_tracking_valid`、`rb_mean_error` 等;默认时间戳是墙钟 Unix 微秒(`time_unit="us_since_epoch"`)。
+
+> ⚠️ **时间对齐说明**:`record_mocap.py --sync-from` 可把 mocap 时间戳对齐到相机时间轴,
+> 但它依赖一个同步文件,而本目录的 `dvx_record.py` 目前**不写**这个文件(原工程是 `record_raw.py --sync-out` 写的)。
+> 所以现在:单独录 mocap 没问题;要做「事件 + mocap 严格时间对齐」需要再给 `dvx_record.py` 补一个 `--sync-out`(可让我加)。
 
 ## 其它常用参数(脚本通用)
 
