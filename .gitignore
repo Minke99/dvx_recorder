@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# 本地 Claude / 编辑器设置
+.claude/
+.DS_Store
+*.swp
+
+# 录制数据与渲染产物(代码仓库不放大文件)
+recordings/
+*.h5
+*.mp4
