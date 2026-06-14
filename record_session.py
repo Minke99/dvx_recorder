@@ -196,6 +196,7 @@ def main():
     ap.add_argument("--multicast", default="239.255.42.99", help="NatNet 组播地址")
     ap.add_argument("--port", type=int, default=1511, help="NatNet 端口")
     ap.add_argument("--bind-ip", default="0.0.0.0", help="本地绑定 IP")
+    ap.add_argument("--no-mocap", action="store_true", help="完全不录 mocap(只录事件;排查丢包用)")
     # 预览(默认关:只录盘;加 --preview 才开实时窗口)
     ap.add_argument("--preview", action="store_true",
                     help="开实时预览窗口(默认关:只录盘,避免高事件率下显示拖慢相机排空)")
@@ -270,14 +271,19 @@ def main():
     frame_dt = 1.0 / args.fps
     preview_buf = dv.EventStore()   # 累积「上次渲染以来」的事件,渲染时一次性处理
 
-    # 启动 mocap 线程
+    # 启动 mocap 线程(--no-mocap 时完全不碰 mocap,用于排查丢包来源)
     q = queue.Queue()
     stop_evt = threading.Event()
     mstate = {"ok": None}
-    mthread = threading.Thread(target=mocap_worker,
-                               args=(q, stop_evt, mstate, args.bind_ip, args.port, args.multicast),
-                               daemon=True)
-    mthread.start()
+    use_mocap = not args.no_mocap
+    mthread = None
+    if use_mocap:
+        mthread = threading.Thread(target=mocap_worker,
+                                   args=(q, stop_evt, mstate, args.bind_ip, args.port, args.multicast),
+                                   daemon=True)
+        mthread.start()
+    else:
+        print("mocap: 关(--no-mocap,只录事件)")
 
     anchor = None              # (cam_first_us, wall_first_us)
     mocap_pending = []         # 锚点确立前先缓存的 mocap 包
@@ -410,7 +416,8 @@ def main():
             if show:
                 cv2.destroyAllWindows()
 
-    mthread.join(timeout=1.0)
+    if mthread is not None:
+        mthread.join(timeout=1.0)
     print(f"\n已保存 session: {session_dir}")
     print(f"  events.h5 : {st['events']:,} 事件 / {ev_packets} 批次")
     print(f"  mocap.h5  : {mocap_idx:,} 包 / {st['mocap_bodies']:,} 刚体观测  (mocap_ok={mstate['ok']})")
